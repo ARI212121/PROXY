@@ -1,0 +1,104 @@
+name: SMTP-framed proxy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: proxy-server
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  BORE_PORT: "26842"
+  MAIL_HOST: "mx.example.com"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tune kernel (BBR + big buffers)
+        run: |
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
+
+      - name: Download bore
+        run: |
+          curl -L -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore.tgz && chmod +x bore && ./bore --version
+
+      - name: Start tunnel server on :2525
+        run: |
+          nohup python3 server/tunnel_server.py 2525 > srv.log 2>&1 &
+          sleep 2
+          ss -ltnp 2>/dev/null | grep ':2525' && echo "server up" || { cat srv.log; exit 1; }
+
+      - name: Open bore tunnel
+        run: |
+          nohup ./bore local 2525 --to bore.pub --port "$BORE_PORT" > bore.log 2>&1 &
+          for i in $(seq 1 30); do
+            EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+            [ -n "$EP" ] && break; sleep 1
+          done
+          [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
+          echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
+
+      - name: Publish endpoint + keep alive (~5h48m), self-restart before the 6h cap
+        env:
+          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          git config user.name  proxy-bot
+          git config user.email proxy-bot@users.noreply.github.com
+
+          publish() {
+            git checkout -f main
+            git branch -D live 2>/dev/null || true
+            git checkout --orphan live
+            git reset >/dev/null 2>&1 || true
+            printf '{"endpoint":"%s","updated":"%s"}\n' "$1" "$(date -u +%FT%TZ)" > endpoint.json
+            git add -f endpoint.json
+            git commit -m "endpoint $1" >/dev/null
+            git push -f origin live
+            git checkout -f main
+            echo "published $1"
+          }
+
+          dispatch_next() {
+            if [ -z "$DISPATCH_PAT" ]; then
+              echo "[warn] no DISPATCH_PAT secret - falling back to the 5h schedule only"
+              return
+            fi
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $DISPATCH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/proxy.yml/dispatches" \
+              -d '{"ref":"main"}')
+            echo "[self-restart] dispatched successor run -> HTTP $code"
+          }
+
+          LAST=$(cat /tmp/ep.txt)
+          publish "$LAST"
+
+          armed=0
+          for i in $(seq 1 348); do
+            pgrep -f "bore local 2525"  >/dev/null || { echo cf-restart;  nohup ./bore local 2525 --to bore.pub --port "$BORE_PORT" >> bore.log 2>&1 & }
+            pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
+            CUR=$(grep -oE 'bore\.pub:[0-9]+' bore.log | tail -1)
+            if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
+              echo "bore port changed: $LAST -> $CUR"
+              publish "$CUR"; LAST="$CUR"
+            fi
+            if [ "$i" -eq 330 ] && [ "$armed" -eq 0 ]; then
+              dispatch_next; armed=1
+            fi
+            sleep 60
+          done
+          echo "==== srv.log tail ===="; tail -60 srv.log
